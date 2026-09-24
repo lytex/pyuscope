@@ -393,7 +393,8 @@ class GRBLSer:
             print("rx %u bytes in %0.3f sec" % (len(b), tend - tstart))
             if self.verbose >= 2:
                 util.hexdump(b)
-        return b.decode("ascii").strip()
+        # Unprogrammed build info reads back as 0xFF padding
+        return b.replace(b"\xff", b"").decode("ascii").strip()
 
     def txrxs(self, out, nl=True, trim_data=True, timeout=None):
         """
@@ -586,7 +587,13 @@ class GRBLSer:
         "VER:ARM32 V2.2.20220826:",
         "OPT:VZL,35,254",
         """
-        return self.txrxs("$I")
+        # Some vendor firmware (ex: Monport) prints a bare banner line
+        # before the bracketed info lines. Keep only the bracketed ones
+        lines = self.txrxs("$I", trim_data=False)
+        return [
+            trim_data_line(l) for l in lines
+            if l.startswith("[") and l.endswith("]")
+        ]
 
     def info(self):
         ver, opt = self.i()

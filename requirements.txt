@@ -1,0 +1,35 @@
+# Python dependencies translated from the apt-get / pip install script.
+#
+# NOT pip-installable. Install these with the system package manager first:
+#   GStreamer runtime + GI typelibs   (gir1.2-gstreamer-1.0, gstreamer1.0-plugins-*)
+#   RTSP server libs                  (libgstrtspserver-1.0-0, libgstrtspserver-1.0-dev,
+#                                      gir1.2-gst-rtsp-server-1.0)
+#   imagemagick                       (command-line tool, not a Python package)
+#   luminance-hdr                     (standalone application)
+#   libzbar0                          (shared library required by pyzbar)
+#   Build deps for PyGObject          (libgirepository1.0-dev or libgirepository-2.0-dev,
+#                                      libcairo2-dev, pkg-config, python3-dev)
+ 
+# --- Formerly apt packages ---
+#PyGObject            # was python3-gi; compiles from source, needs the build deps above
+                     # python3-gst-1.0 (Gst Python overrides) has no clean pip equivalent
+PyQt5                # was python3-pyqt5
+pyusb                # was python3-usb
+opencv-python-headless  # was python3-opencv; headless avoids Qt plugin clashes with PyQt5
+pyserial             # was python3-serial
+numpy                # was python3-numpy
+scipy                # was python3-scipy
+distro               # was python3-distro
+pyzbar               # was python3-zbar; DIFFERENT API (import zbar -> from pyzbar import pyzbar)
+Werkzeug             # was python3-werkzeug
+ 
+# --- Already installed via pip ---
+json5
+boto3
+pygame
+psutil
+bitarray
+piexif
+Flask>=2.2.2
+setuptools==60.0.0
+git+https://github.com/antmicro/pyrav4l2.git

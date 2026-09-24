@@ -277,6 +277,13 @@ class USCImager:
     def videoflip_method(self):
         return self.j.get("videoflip_method", None)
 
+    def source_mjpeg(self):
+        """
+        Camera only outputs MJPEG (ex: some UVC cameras)
+        Decode it before the raw caps negotiation
+        """
+        return bool(self.j.get("source_mjpeg", False))
+
     def cal_fn_data(self):
         return os.path.join(self.microscope.usc.get_microscope_data_dir(),
                             "imager_calibration.j5")

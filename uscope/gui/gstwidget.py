@@ -661,6 +661,22 @@ class GstVideoPipeline:
         self.prepareSource()
         self.player.add(self.source)
         self.raw_element = self.source
+
+        # Some cameras only output MJPEG => decode before raw caps
+        # First element after the source (relinked on source restart)
+        self.source_next = None
+        if self.ac.microscope.usc.imager.source_mjpeg():
+            raw_w, raw_h = self.ac.microscope.usc.imager.raw_wh()
+            self.jpeg_capsfilter = Gst.ElementFactory.make("capsfilter")
+            self.jpeg_capsfilter.props.caps = Gst.Caps(
+                "image/jpeg,width=%u,height=%u" % (raw_w, raw_h))
+            self.link_next_raw_element(self.jpeg_capsfilter)
+            self.source_next = self.jpeg_capsfilter
+            self.jpegdec = Gst.ElementFactory.make("jpegdec")
+            assert self.jpegdec, "Failed to create jpegdec"
+            self.link_next_raw_element(self.jpegdec)
+            self.videoconvert_mjpeg = Gst.ElementFactory.make("videoconvert")
+            self.link_next_raw_element(self.videoconvert_mjpeg)
         """
         observation:
         -adding caps negotation on v4l2src fixed lots of issues (although roi still not working)
@@ -676,6 +692,8 @@ class GstVideoPipeline:
         self.raw_capsfilter.props.caps = Gst.Caps(
             "video/x-raw,width=%u,height=%u" % (raw_w, raw_h))
         self.link_next_raw_element(self.raw_capsfilter)
+        if self.source_next is None:
+            self.source_next = self.raw_capsfilter
 
         # Hack to use a larger than needed camera sensor
         # Crop out the unused sensor area
@@ -827,7 +845,7 @@ class GstVideoPipeline:
         # Stop pipeline and remove the bad element
         self.ok = False
         self.player.set_state(Gst.State.NULL)
-        self.source.unlink(self.raw_capsfilter)
+        self.source.unlink(self.source_next)
         self.player.remove(self.source)
         self.source = None
 
@@ -835,7 +853,7 @@ class GstVideoPipeline:
         self.prepareSource()
         self.player.add(self.source)
         # Now insert it back into the pipeline
-        if not self.source.link(self.raw_capsfilter):
+        if not self.source.link(self.source_next):
             raise RuntimeError("Couldn't set capabilities on the source")
         # Go go go!
         # Hopefully we'll come back up
