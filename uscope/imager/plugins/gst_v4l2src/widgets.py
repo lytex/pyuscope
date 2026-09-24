@@ -7,25 +7,32 @@ from uscope.gui.control_scroll import GstControlScroll
 
 from collections import OrderedDict
 
+# v4l2src reports 0 as the default for these properties (not the camera's)
+# Writing that back sets e.g. saturation=0 => black and white image
+# Instead use None so the value is read back from the camera
 groups_gst = OrderedDict([
     ("HSV+", [
         {
             "prop_name": "brightness",
+            "default": None,
             "min": 0,
             "max": 255
         },
         {
             "prop_name": "contrast",
+            "default": None,
             "min": 0,
             "max": 255
         },
         {
             "prop_name": "saturation",
+            "default": None,
             "min": 0,
             "max": 100
         },
         {
             "prop_name": "hue",
+            "default": None,
             "min": -180,
             "max": 180
         },
