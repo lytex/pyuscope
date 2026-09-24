@@ -44,6 +44,16 @@ class V4L2GstControlScroll(GstControlScroll):
                                   ac=ac,
                                   parent=parent)
 
+    # Generic camera: no exposure / auto controls exposed
+    def get_exposure_disp_property(self):
+        return None
+
+    def auto_exposure_enabled(self):
+        return False
+
+    def auto_color_enabled(self):
+        return False
+
 
 class V4L2GstControlScrollTest(V4L2GstControlScroll):
     def auto_exposure_enabled(self):

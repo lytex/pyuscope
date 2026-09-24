@@ -689,8 +689,11 @@ class GstVideoPipeline:
         # Select the correct resolution from the camera
         # This is pre-crop so it must be the actual resolution
         raw_w, raw_h = self.ac.microscope.usc.imager.raw_wh()
-        self.raw_capsfilter.props.caps = Gst.Caps(
-            "video/x-raw,width=%u,height=%u" % (raw_w, raw_h))
+        raw_caps = "video/x-raw,width=%u,height=%u" % (raw_w, raw_h)
+        # jpegdec outputs I420 but v4l2 snapshot decode expects YUYV
+        if self.ac.microscope.usc.imager.source_mjpeg():
+            raw_caps += ",format=YUY2"
+        self.raw_capsfilter.props.caps = Gst.Caps(raw_caps)
         self.link_next_raw_element(self.raw_capsfilter)
         if self.source_next is None:
             self.source_next = self.raw_capsfilter

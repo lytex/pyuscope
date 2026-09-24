@@ -655,8 +655,12 @@ class ImagerControlScroll(QScrollArea):
         """
         FIXME: adjust this for toupcamsrc and v4l2src
         I think both report in us though?
+        Returns None if the camera has no exposure control
         """
-        return meta["disp_properties"][self.get_exposure_disp_property()] / 1e6
+        disp_prop = self.get_exposure_disp_property()
+        if disp_prop is None:
+            return None
+        return meta["disp_properties"][disp_prop] / 1e6
 
     def captured_image_exposure(self, captured_image):
         return captured_image.meta["disp_properties"][
@@ -678,12 +682,7 @@ class ImagerControlScroll(QScrollArea):
         # exif["Exif"] = {33434: (16660, 1000000)}
         # XXX: are there defines we can use instead of hard coding constants?
         exposure_seconds = self.get_meta_exposure_seconds(captured_image.meta)
-        exp_tuple = (int(exposure_seconds * 1e6), int(1e6))
         exif["Exif"] = {
-            # manual exposure
-            34850: 1,
-            # exposure time as rational
-            33434: exp_tuple,
             # ISO
             #34855: 118,
             34855: 1,
@@ -692,6 +691,11 @@ class ImagerControlScroll(QScrollArea):
             # 33437: (22, 100),
             33437: (1, 1),
         }
+        if exposure_seconds is not None:
+            # manual exposure
+            exif["Exif"][34850] = 1
+            # exposure time as rational
+            exif["Exif"][33434] = (int(exposure_seconds * 1e6), int(1e6))
         captured_image.set_exif_bytes(piexif.dump(exif))
 
 

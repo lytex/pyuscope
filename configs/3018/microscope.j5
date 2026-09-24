@@ -7,8 +7,8 @@
             "port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
         },
         "soft_limits": {
-            "xmin": 0.0, "xmax": 300.0,
-            "ymin": 0.0, "ymax": 300.0,
+            "xmin": -300.0, "xmax": 300.0,
+            "ymin": -180.0, "ymax": 180.0,
         },
     },
     "imager": {
