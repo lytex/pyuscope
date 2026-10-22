@@ -1241,6 +1241,15 @@ class ImagingOptionsWindow(QWidget):
             layout.addWidget(QLabel("Autofocus corners?"), row, 1)
             row += 1
 
+            self.autofocus_each_cb = QCheckBox()
+            self.autofocus_each_cb.setChecked(False)
+            self.autofocus_each_cb.setEnabled(self.ac.microscope.has_z())
+            self.autofocus_each_cb.stateChanged.connect(
+                self.itw.update_imaging_config)
+            layout.addWidget(self.autofocus_each_cb, row, 0)
+            layout.addWidget(QLabel("Autofocus each image?"), row, 1)
+            row += 1
+
             def process_gb():
                 layout = QGridLayout()
                 row = 0
@@ -1638,6 +1647,8 @@ class ImagingTaskWidget(AWidget):
 
             scan_settings = "Scan settings:"
             scan_settings += "\nAutofocus corners: %s" % (autofocus, )
+            scan_settings += "\nAutofocus each image: %s" % (
+                self.iow.autofocus_each_cb.isChecked(), )
             if self.ac.advancedTab.image_stacking_enabled():
                 pm_n = self.ac.advancedTab.image_stacking_pm_n()
                 scan_settings += "\nFocus stacking enabled (+/- %u images => %u per stack)" % (
@@ -1758,6 +1769,9 @@ class ImagingTaskWidget(AWidget):
         imagerj["save_quality"] = self.ac.usc.imager.save_quality()
         # FIXME: move scan autofocus from Argus to planner
         # imagerj["autofocus"] = self.iow.autofocus_cb.isChecked()
+        if self.ac.microscope.has_z() and self.iow.autofocus_each_cb.isChecked(
+        ):
+            pconfig["points-autofocus"] = {}
 
         # Serialized into cs_auto.py CLI option
         ippj = pconfig.setdefault("ipp", {})
@@ -1780,6 +1794,7 @@ class ImagingTaskWidget(AWidget):
             # However its useful for debug dumps
             "cloudstitch": self.iow.cloudstitch_cb.isChecked(),
             "autofocus": self.iow.autofocus_cb.isChecked(),
+            "autofocus_each": self.iow.autofocus_each_cb.isChecked(),
             "add_scalebar": self.iow.add_scalebar_cb.isChecked(),
             "keep_intermediate": self.iow.keep_intermediate_cb.isChecked(),
             "html": self.iow.html_cb.isChecked(),
@@ -1794,6 +1809,8 @@ class ImagingTaskWidget(AWidget):
         self.iow.stitch_gb.setChecked(j.get("stitch", True))
         self.iow.autofocus_cb.setChecked(
             j.get("autofocus", self.ac.microscope.has_z()))
+        self.iow.autofocus_each_cb.setChecked(
+            j.get("autofocus_each", False) and self.ac.microscope.has_z())
         self.iow.add_scalebar_cb.setChecked(j.get("add_scalebar", False))
         self.iow.keep_intermediate_cb.setChecked(
             j.get("keep_intermediate", True))
@@ -1806,6 +1823,7 @@ class ImagingTaskWidget(AWidget):
             "stitch": self.iow.stitch_gb.isChecked(),
             "add_scalebar": self.iow.add_scalebar_cb.isChecked(),
             "autofocus": self.iow.autofocus_cb.isChecked(),
+            "autofocus_each": self.iow.autofocus_each_cb.isChecked(),
         }
 
 

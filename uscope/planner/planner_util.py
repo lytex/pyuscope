@@ -134,6 +134,8 @@ def get_planner(microscope,
         pipeline_names.append("points-xy2p")
     if "points-xy3p" in pconfig:
         pipeline_names.append("points-xy3p")
+    if "points-autofocus" in pconfig:
+        pipeline_names.append("points-autofocus")
     if "points-stacker" in pconfig:
         pipeline_names.append("points-stacker")
     # FIXME: needs review / testing

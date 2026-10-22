@@ -574,6 +574,30 @@ class XYPosGenerator:
             assert 0, self.pattern
 
 
+def planner_autofocus(plugin):
+    # Planner motion HAL moves are already blocking and don't take block=
+    def move_absolute(pos, block=True):
+        plugin.motion.move_absolute(pos)
+
+    return Autofocus(plugin.microscope,
+                     move_absolute=move_absolute,
+                     pos=plugin.planner.motion.pos,
+                     imager=plugin.imager,
+                     kinematics=plugin.microscope.kinematics,
+                     log=plugin.log,
+                     poll=plugin.planner.check_yield)
+
+
+def planner_objective_config(plugin):
+    # Argus stores the active objective (incl. NA) under app metadata
+    ret = plugin.pc.j.get("points-autofocus", {}).get("objective")
+    if ret is None:
+        ret = plugin.pc.j.get("app", {}).get("objective")
+    if ret is None or "na" not in ret:
+        raise ValueError("Autofocus requires objective config with \"na\"")
+    return ret
+
+
 class PointGenerator3P(PlannerPlugin):
     def __init__(self, planner):
         super().__init__(planner=planner)
@@ -608,19 +632,14 @@ class PointGenerator3P(PlannerPlugin):
         Refocus corners before starting scan
         Intended for large batch jobs that may drift before the scan starts
         """
-        af = Autofocus(self.microscope,
-                       move_absolute=self.motion.move_absolute,
-                       pos=self.planner.motion.pos,
-                       imager=self.imager,
-                       kinematics=self.kinematics,
-                       log=self.log,
-                       poll=self.planner.check_yield)
+        af = planner_autofocus(self)
+        objective_config = planner_objective_config(self)
 
         for corner in ("ul", "ll", "lr"):
             self.planner.check_yield()
             self.motion.move_absolute(corners[corner])
             self.planner.check_yield()
-            af.coarse()
+            af.coarse(objective_config)
             self.planner.check_yield()
             corners[corner] = self.planner.motion.pos()
 
@@ -850,6 +869,64 @@ class PointGenerator3P(PlannerPlugin):
             'points_generated': self.itered_xy_points,
             "points": points,
             "axes": axes,
+        }
+
+
+"""
+Autofocus at every XY position of a panorama
+Runs after the XY point generator and before stacking / capture
+"""
+
+
+class PlannerAutofocus(PlannerPlugin):
+    def __init__(self, planner):
+        super().__init__(planner=planner)
+        config = self.pc.j["points-autofocus"]
+        # "coarse": coarse + fine search every image (robust, slower)
+        # "fine": coarse + fine on the first image, then fine only
+        #   (adjacent tiles are usually close in focus)
+        self.mode = config.get("mode", "coarse")
+        assert self.mode in ("coarse", "fine"), self.mode
+        self.objective_config = None
+        self.af = None
+        self.focused = 0
+
+    def scan_begin(self, state):
+        self.objective_config = planner_objective_config(self)
+        self.af = planner_autofocus(self)
+        self.focused = 0
+
+    def log_scan_begin(self):
+        self.log("Autofocus each image: mode %s" % self.mode)
+
+    def iterate(self, state):
+        if self.dry:
+            yield None
+            return
+
+        # When stacking, the XY generators don't move z but record the
+        # target in z_center. Search from there and hand the result back
+        start_pos = None
+        if self.planner.stacking() and self.planner.z_center is not None:
+            start_pos = self.planner.z_center
+
+        if self.mode == "coarse" or self.focused == 0:
+            z = self.af.coarse(self.objective_config, start_pos=start_pos)
+        else:
+            z = self.af.fine(self.objective_config, start_pos=start_pos)
+        self.focused += 1
+        self.planner.z_center = z
+
+        modifiers = {}
+        replace_keys = {
+            "autofocus_z": z,
+        }
+        yield modifiers, replace_keys
+
+    def gen_meta(self, meta):
+        meta["points-autofocus"] = {
+            "mode": self.mode,
+            "focused": self.focused,
         }
 
 
@@ -1320,6 +1397,7 @@ class PlannerScraper(PlannerPlugin):
 def register_plugins():
     register_plugin("points-xy2p", PointGenerator2P)
     register_plugin("points-xy3p", PointGenerator3P)
+    register_plugin("points-autofocus", PlannerAutofocus)
     register_plugin("points-stacker", PlannerStacker)
     register_plugin("stacker-drift", StackerDrift)
     register_plugin("hdr", PlannerHDR)

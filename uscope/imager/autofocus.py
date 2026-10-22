@@ -141,7 +141,11 @@ class Autofocus:
             "step_pm": 3,
         }
 
-    def coarse(self, objective_config):
+    def coarse(self, objective_config, start_pos=None):
+        """
+        Coarse + fine focus around start_pos (default: current z)
+        Returns the final z position
+        """
         with StopEvent(self.microscope) as se:
             # MVP intended for 20x
             # 2 um is standard focus step size
@@ -150,14 +154,31 @@ class Autofocus:
             coarse_z = self.auto_focus_pass(se,
                                             step_size=parameters["step_size"],
                                             step_pm=parameters["step_pm"],
-                                            move_target=False)
+                                            move_target=False,
+                                            start_pos=start_pos)
             self.log("autofocus: fine")
             parameters = self.fine_parameters(objective_config)
-            self.auto_focus_pass(se,
-                                 step_size=parameters["step_size"],
-                                 step_pm=parameters["step_pm"],
-                                 start_pos=coarse_z)
+            fine_z = self.auto_focus_pass(se,
+                                          step_size=parameters["step_size"],
+                                          step_pm=parameters["step_pm"],
+                                          start_pos=coarse_z)
             self.log("autofocus: done")
+            return fine_z
+
+    def fine(self, objective_config, start_pos=None):
+        """
+        Fine focus only around start_pos (default: current z)
+        Returns the final z position
+        """
+        with StopEvent(self.microscope) as se:
+            self.log("autofocus: fine")
+            parameters = self.fine_parameters(objective_config)
+            fine_z = self.auto_focus_pass(se,
+                                          step_size=parameters["step_size"],
+                                          step_pm=parameters["step_pm"],
+                                          start_pos=start_pos)
+            self.log("autofocus: done")
+            return fine_z
 
 
 class AutoStacker:
