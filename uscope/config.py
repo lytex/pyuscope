@@ -1140,6 +1140,13 @@ class PC:
     def exclude(self):
         return self.j.get('exclude', [])
 
+    def only(self):
+        """
+        Partial scan: list of tiles to (re)capture, None for all
+        See parse_tile_selection() for format
+        """
+        return self.j.get('only')
+
     def end_at(self):
         return self.j.get("end_at", "start")
 

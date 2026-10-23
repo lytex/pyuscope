@@ -1,3 +1,4 @@
+import re
 from uscope.planner.planner_util import microscope_to_planner_config
 from uscope import config
 from collections import OrderedDict
@@ -1250,6 +1251,15 @@ class ImagingOptionsWindow(QWidget):
             layout.addWidget(QLabel("Autofocus each image?"), row, 1)
             row += 1
 
+            # Partial scan to retake bad tiles. Not cached on purpose:
+            # a stale selection would silently skip most of the next scan
+            layout.addWidget(QLabel("Retake only"), row, 0)
+            self.retake_only_le = QLineEdit("")
+            self.retake_only_le.setPlaceholderText(
+                "all tiles (or e.g. c005_r003, c006_r003)")
+            layout.addWidget(self.retake_only_le, row, 1)
+            row += 1
+
             def process_gb():
                 layout = QGridLayout()
                 row = 0
@@ -1649,6 +1659,14 @@ class ImagingTaskWidget(AWidget):
             scan_settings += "\nAutofocus corners: %s" % (autofocus, )
             scan_settings += "\nAutofocus each image: %s" % (
                 self.iow.autofocus_each_cb.isChecked(), )
+            try:
+                retake_only = self.retake_only()
+            except ValueError as e:
+                self.ac.log(f"Scan aborted: {e}")
+                return
+            if retake_only:
+                scan_settings += "\nPARTIAL SCAN, retake only: %s" % (
+                    ", ".join(retake_only), )
             if self.ac.advancedTab.image_stacking_enabled():
                 pm_n = self.ac.advancedTab.image_stacking_pm_n()
                 scan_settings += "\nFocus stacking enabled (+/- %u images => %u per stack)" % (
@@ -1772,6 +1790,24 @@ class ImagingTaskWidget(AWidget):
         if self.ac.microscope.has_z() and self.iow.autofocus_each_cb.isChecked(
         ):
             pconfig["points-autofocus"] = {}
+        retake_only = self.retake_only()
+        if retake_only:
+            pconfig["only"] = retake_only
+
+    def retake_only(self):
+        """
+        Tiles listed in the "Retake only" box, comma / space separated
+        Accepts file names, ex: c005_r003.jpg => c005_r003
+        """
+        text = str(self.iow.retake_only_le.text())
+        ret = []
+        for item in text.replace(",", " ").split():
+            m = re.match(r"(c\d+_r\d+)", item)
+            if not m:
+                raise ValueError(
+                    "Bad retake tile %r, expected like c005_r003" % (item, ))
+            ret.append(m.group(1))
+        return ret
 
         # Serialized into cs_auto.py CLI option
         ippj = pconfig.setdefault("ipp", {})

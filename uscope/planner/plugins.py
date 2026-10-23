@@ -1,4 +1,5 @@
 import math
+import re
 from collections import OrderedDict
 import os
 import time
@@ -197,6 +198,56 @@ class SamplePointGenerator(PlannerPlugin):
                 yield modifiers, replace_keys
 
 
+def parse_tile_selection(only, cols, rows):
+    """
+    Return the set of (ul_col, ul_row) tiles selected by the "only" config
+    Items are either a file name / prefix like "c005_r003" (as saved on disk)
+    or an inclusive range {"c0": 5, "c1": 7, "r0": 2, "r1": 3}
+    A missing range limit means the whole grid on that side
+    """
+    ret = set()
+    for item in only:
+        if isinstance(item, str):
+            m = re.match(r"c(\d+)_r(\d+)", item.strip())
+            if not m:
+                raise ValueError("Bad tile name %r, expected like c005_r003" %
+                                 (item, ))
+            tiles = [(int(m.group(1)), int(m.group(2)))]
+        elif isinstance(item, dict):
+            c0 = int(item.get("c0", 0))
+            c1 = int(item.get("c1", cols - 1))
+            r0 = int(item.get("r0", 0))
+            r1 = int(item.get("r1", rows - 1))
+            tiles = [(col, row) for col in range(c0, c1 + 1)
+                     for row in range(r0, r1 + 1)]
+        else:
+            raise ValueError("Bad tile selection %r" % (item, ))
+        for col, row in tiles:
+            if not (0 <= col < cols and 0 <= row < rows):
+                raise ValueError(
+                    "Tile c%03u_r%03u outside of %u cols x %u rows scan" %
+                    (col, row, cols, rows))
+            ret.add((col, row))
+    if not ret:
+        raise ValueError("Tile selection is empty")
+    return ret
+
+
+def gen_selected_pos_ll_ul(self):
+    """
+    gen_pos_ll_ul() filtered down to the "only" tile selection, if any
+    Keeps the full grid so positions and file names match the original scan
+    """
+    only = self.pc.only()
+    if only is None:
+        yield from self.gen_pos_ll_ul()
+        return
+    selected = parse_tile_selection(only, self.cols, self.rows)
+    for x in self.gen_pos_ll_ul():
+        if x[2] in selected:
+            yield x
+
+
 def log_scan_xy_begin(self):
     # A true useful metric of efficieny loss is how many extra pictures we had to take
     # Maybe overhead is a better way of reporting it
@@ -300,6 +351,9 @@ def log_scan_xy_begin(self):
              (self.x.images_actual(), self.y.images_actual(),
               self.x.images_actual() * self.y.images_actual()))
     self.log('    Generated positions: %u' % self.points_expected())
+    if self.pc.only() is not None:
+        self.log('    Partial scan: only %u / %u tiles' %
+                 (self.points_expected(), self.rows * self.cols))
     self.log('    step: %0.3f x, %0.3f y' % (self.x.step(), self.y.step()))
 
 
@@ -445,10 +499,10 @@ class PointGenerator2P(PlannerPlugin):
             yield (x, y)
 
     def points_expected(self):
-        return self.rows * self.cols
+        return sum(1 for _ in gen_selected_pos_ll_ul(self))
 
     def images_expected(self):
-        return self.rows * self.cols
+        return self.points_expected()
 
     def log_scan_begin(self):
         self.log("XY2P")
@@ -461,7 +515,7 @@ class PointGenerator2P(PlannerPlugin):
 
     def iterate(self, state):
         # columns
-        for (pos, _ll, (ul_col, ul_row)) in self.gen_pos_ll_ul():
+        for (pos, _ll, (ul_col, ul_row)) in gen_selected_pos_ll_ul(self):
             self.itered_xy_points += 1
             self.log('')
             self.log(
@@ -498,7 +552,7 @@ class PointGenerator2P(PlannerPlugin):
 
     def gen_meta(self, meta):
         points = OrderedDict()
-        for (pos, _ll, (ul_col, ul_row)) in self.gen_pos_ll_ul():
+        for (pos, _ll, (ul_col, ul_row)) in gen_selected_pos_ll_ul(self):
             k = self.filename_part(ul_col, ul_row)
             v = dict(pos)
             v.update({"col": ul_col, "row": ul_row})
@@ -507,6 +561,7 @@ class PointGenerator2P(PlannerPlugin):
         for axisc, axis in self.axes.items():
             axes[axisc] = axis.meta()
         meta["points-xy2p"] = {
+            "only": self.pc.only(),
             'points_to_generate': self.points_expected(),
             'points_generated': self.itered_xy_points,
             "points": points,
@@ -778,10 +833,10 @@ class PointGenerator3P(PlannerPlugin):
                 self.per_row[axis] = polyfit(xs, ys, 1)[0]
 
     def points_expected(self):
-        return self.rows * self.cols
+        return sum(1 for _ in gen_selected_pos_ll_ul(self))
 
     def images_expected(self):
-        return self.rows * self.cols
+        return self.points_expected()
 
     def calc_pos(self, ll_col, ll_row):
         ret = {}
@@ -821,7 +876,7 @@ class PointGenerator3P(PlannerPlugin):
         self.motion.move_absolute(pos)
 
     def iterate(self, state):
-        for (pos, _ll, (ul_col, ul_row)) in self.gen_pos_ll_ul():
+        for (pos, _ll, (ul_col, ul_row)) in gen_selected_pos_ll_ul(self):
             self.log('')
             self.itered_xy_points += 1
             if "z" in pos and not self.tracking_z:
@@ -856,7 +911,7 @@ class PointGenerator3P(PlannerPlugin):
 
     def gen_meta(self, meta):
         points = OrderedDict()
-        for (pos, _ll, (ul_col, ul_row)) in self.gen_pos_ll_ul():
+        for (pos, _ll, (ul_col, ul_row)) in gen_selected_pos_ll_ul(self):
             k = self.filename_part(ul_col, ul_row)
             v = dict(pos)
             v.update({"col": ul_col, "row": ul_row})
@@ -865,6 +920,7 @@ class PointGenerator3P(PlannerPlugin):
         for axisc, axis in self.axes.items():
             axes[axisc] = axis.meta()
         meta["points-xy3p"] = {
+            "only": self.pc.only(),
             'points_to_generate': self.points_expected(),
             'points_generated': self.itered_xy_points,
             "points": points,

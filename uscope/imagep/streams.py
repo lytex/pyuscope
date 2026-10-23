@@ -5,6 +5,7 @@ from uscope.imagep.util import TaskBarrier, EtherealImageR, EtherealImageW, remo
 from uscope.imagep.summary import write_html_viewer, write_snapshot_grid, write_quick_pano
 from uscope.util import writej
 import glob
+import json
 import shutil
 import os
 from PIL import Image
@@ -21,6 +22,18 @@ def get_image_suffix(dir_in):
         return ".tif"
     else:
         return ".jpg"
+
+
+def is_partial_scan(dir_in):
+    """
+    Planner "only" scans retake a subset of tiles to replace bad ones
+    """
+    scan_fn = os.path.join(dir_in, "uscan.json")
+    if not os.path.exists(scan_fn):
+        return False
+    with open(scan_fn) as f:
+        scanj = json.load(f)
+    return scanj.get("pconfig", {}).get("only") is not None
 
 
 class ImageStream:
@@ -239,6 +252,7 @@ class DirCSIP:
 
         self.log("Reading metadata...")
         working_iindex = index_scan_images(self.directory)
+        partial = is_partial_scan(self.directory)
         dst_basename = os.path.basename(os.path.abspath(self.directory))
 
         print("Microscope: %s" % (self.microscope.name, ))
@@ -325,10 +339,18 @@ class DirCSIP:
             working_iindex = index_scan_images(next_dir)
 
         self.verbose and self.log("")
-        healthy = self.csip.inspect_final_dir(working_iindex)
+        if partial:
+            # Missing tiles are expected. Keep the corrected tiles but don't
+            # try to fix or summarize as if it were a full panorama
+            self.log(
+                "Partial scan: processed %u tiles, skipping summary and stitching"
+                % len(working_iindex["crs"]))
+            healthy = False
+        else:
+            healthy = self.csip.inspect_final_dir(working_iindex)
         self.verbose and self.log("")
 
-        if not healthy and self.best_effort:
+        if not healthy and self.best_effort and not partial:
             if not self.fix:
                 raise Exception(
                     "Need to fix data to continue, but --fix not specified")
