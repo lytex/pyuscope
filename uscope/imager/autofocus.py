@@ -4,9 +4,29 @@ from uscope.imagep.util import RC_CONST
 from uscope.microscope import StopEvent
 
 
-def choose_best_image(images_iter, log=None, verbose=False):
-    take_center = True
+def image_sharpness(im_pil, take_center=True, blur=9):
+    """
+    Focus score of a PIL image: variance of the Laplacian (higher = sharper)
+    Only comparable between images of the same size / processing
+    """
+    if take_center:
+        width, height = im_pil.size
 
+        left = (width - width / 3) / 2
+        top = (height - height / 3) / 2
+        right = (width + width / 3) / 2
+        bottom = (height + height / 3) / 2
+
+        # Crop the center of the image
+        im_pil = im_pil.crop((left, top, right, bottom))
+
+    im_cv = np.array(im_pil.convert("RGB"))[:, :, ::-1].copy()
+    filtered = cv.medianBlur(im_cv, blur)
+    laplacian = cv.Laplacian(filtered, cv.CV_64F)
+    return laplacian.var()
+
+
+def choose_best_image(images_iter, log=None, verbose=False):
     if not log:
 
         def log(s):
@@ -15,28 +35,7 @@ def choose_best_image(images_iter, log=None, verbose=False):
     scores = {}
     verbose and log(" AF choose")
     for fni, (imagek, im_pil) in enumerate(images_iter):
-
-        def get_score(image, blur=9):
-            filtered = cv.medianBlur(image, blur)
-            laplacian = cv.Laplacian(filtered, cv.CV_64F)
-            return laplacian.var()
-
-        def image_pil2cv(im):
-            return np.array(im)[:, :, ::-1].copy()
-
-        if take_center:
-            width, height = im_pil.size
-
-            left = (width - width / 3) / 2
-            top = (height - height / 3) / 2
-            right = (width + width / 3) / 2
-            bottom = (height + height / 3) / 2
-
-            # Crop the center of the image
-            im_pil = im_pil.crop((left, top, right, bottom))
-
-        im_cv = image_pil2cv(im_pil)
-        score = get_score(im_cv)
+        score = image_sharpness(im_pil)
         verbose and log("  AF choose %u (%0.6f): %0.3f" % (fni, imagek, score))
         scores[score] = imagek, fni
     _score, (k, fni) = sorted(scores.items())[-1]
@@ -61,6 +60,9 @@ class Autofocus:
         self.imager = imager
         self.kinematics = kinematics
         self.poll = poll
+        # True if any pass of the last coarse() / fine() picked the first or
+        # last position: real focus may be outside the searched range
+        self.at_edge = False
 
     def move_absolute_wait(self, pos):
         self.move_absolute(pos, block=True)
@@ -108,6 +110,8 @@ class Autofocus:
         target_pos, fni = choose_best_image(gen_images())
         self.log("autofocus: set %0.6f at %u / %u" %
                  (target_pos, fni + 1, steps))
+        if fni in (0, steps - 1):
+            self.at_edge = True
         se.poll()
         if self.poll:
             self.poll()
@@ -141,11 +145,21 @@ class Autofocus:
             "step_pm": 3,
         }
 
+    def coarse_range(self, objective_config):
+        """
+        Max distance coarse() can move from its start position
+        """
+        coarse = self.coarse_parameters(objective_config)
+        fine = self.fine_parameters(objective_config)
+        return (coarse["step_size"] * coarse["step_pm"] +
+                fine["step_size"] * fine["step_pm"])
+
     def coarse(self, objective_config, start_pos=None):
         """
         Coarse + fine focus around start_pos (default: current z)
         Returns the final z position
         """
+        self.at_edge = False
         with StopEvent(self.microscope) as se:
             # MVP intended for 20x
             # 2 um is standard focus step size
@@ -170,6 +184,7 @@ class Autofocus:
         Fine focus only around start_pos (default: current z)
         Returns the final z position
         """
+        self.at_edge = False
         with StopEvent(self.microscope) as se:
             self.log("autofocus: fine")
             parameters = self.fine_parameters(objective_config)

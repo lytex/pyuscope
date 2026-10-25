@@ -2,11 +2,12 @@ import re
 from uscope.planner.planner_util import microscope_to_planner_config
 from uscope import config
 from collections import OrderedDict
-from uscope.gui.widgets import AWidget, ArgusTab
+from uscope.gui.widgets import AWidget, ArgusTab, JogSlider
 from uscope.motion import motion_util
 from uscope.benchmark import Benchmark
 from uscope.app.argus.threads import QPlannerThread
 from uscope.microscope import StopEvent, MicroscopeStop
+from uscope.imager.autofocus import image_sharpness
 from uscope import version as uscope_version
 
 from PyQt5 import Qt
@@ -15,6 +16,7 @@ from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
 
 import os.path
+import json
 import datetime
 from io import StringIO
 import threading
@@ -155,6 +157,21 @@ class MotionWidget(AWidget):
 
             return layout
 
+        def moveto_speed():
+            layout = QHBoxLayout()
+            layout.addWidget(QLabel("MoveTo speed"))
+            # Same log scale as jogging, % of normal move speed
+            self.moveto_slider = JogSlider(ac=self.ac)
+            self.moveto_slider.slider.setValue(
+                self.moveto_slider.slider_max)
+            self.moveto_slider.slider.valueChanged.connect(
+                self.update_moveto_speed_label)
+            layout.addWidget(self.moveto_slider)
+            self.moveto_speed_label = QLabel("")
+            layout.addWidget(self.moveto_speed_label)
+            self.update_moveto_speed_label()
+            return layout
+
         def mdi():
             layout = QHBoxLayout()
             layout.addWidget(QLabel("MDI"))
@@ -163,6 +180,7 @@ class MotionWidget(AWidget):
             layout.addWidget(self.mdi_le)
             return layout
 
+        layout.addLayout(moveto_speed())
         layout.addLayout(move_abs())
 
         self.mdi_le = None
@@ -174,6 +192,26 @@ class MotionWidget(AWidget):
         self.show_advanced_movement(config.bc.dev_mode())
 
         self.setLayout(layout)
+
+    def update_moveto_speed_label(self):
+        self.moveto_speed_label.setText(
+            "%0.3g%%" % self.moveto_slider.get_jog_percentage())
+
+    def moveto_feed_fraction(self):
+        """
+        None for normal speed, otherwise fraction of normal speed
+        """
+        fraction = self.moveto_slider.get_jog_fraction()
+        if fraction >= 1.0:
+            return None
+        return fraction
+
+    def moveto(self, pos):
+        """
+        Move for "MoveTo" buttons, honoring the MoveTo speed slider
+        """
+        self.motion_thread.move_absolute(
+            pos, feed_fraction=self.moveto_feed_fraction())
 
     def show_advanced_movement(self, visible):
         for widget in self.advanced_movement_widgets:
@@ -228,7 +266,7 @@ class MotionWidget(AWidget):
         except ValueError:
             self.log("Invalid reference")
             return
-        self.motion_thread.move_absolute(reference)
+        self.moveto(reference)
 
     def update_reference(self):
         def get_str():
@@ -256,11 +294,14 @@ class MotionWidget(AWidget):
     def _cache_save(self, cachej):
         j = {}
         j["reference"] = str(self.reference_le.text())
+        j["moveto_speed"] = self.moveto_slider.jog_slider_raw()
         cachej["motion"] = j
 
     def _cache_load(self, cachej):
         j = cachej.get("motion", {})
         self.reference_le.setText(j.get("reference", ""))
+        self.moveto_slider.slider.setValue(
+            j.get("moveto_speed", self.moveto_slider.slider_max))
 
 
 class SiPr0nScanNameWidget(AWidget):
@@ -579,6 +620,9 @@ class PlannerWidget(AWidget):
         self.click_corner.connect(self.click_corner_slot)
         self.go_corner.connect(self.go_corner_slot)
         self.corner_widgets = OrderedDict()
+        # Image sharpness when each corner was last set
+        # Reference for the "focus-check" planner plugin
+        self.corner_sharpness = {}
 
     # FIXME: abstract these better
 
@@ -702,14 +746,53 @@ class PlannerWidget(AWidget):
         self.fill_minmax()
 
     # Thread safety to bring back to GUI thread for GUI operations
-    def emit_click_corner(self, corner_name, done=None):
-        self.click_corner.emit((corner_name, done))
+    def emit_click_corner(self, corner_name, done=None, measure=True):
+        self.click_corner.emit((corner_name, done, measure))
 
     def click_corner_slot(self, args):
-        corner_name, done = args
-        self.corner_clicked(corner_name)
+        corner_name, done, measure = args
+        self.corner_clicked(corner_name, measure=measure)
         if done:
             done.set()
+
+    def measure_corner_sharpness(self, corner_name):
+        """
+        Blocking: capture an image like the planner does and record its sharpness
+        Overrides any previous value for this corner
+        """
+        capim = self.ac.microscope.imager_ts().get_by_mode(mode="processed")
+        sharpness = image_sharpness(capim.image)
+        self.corner_sharpness[corner_name] = sharpness
+        self.ac.microscope.log("Corner %s: sharpness %0.1f" %
+                               (corner_name, sharpness))
+        return sharpness
+
+    def measure_corner_sharpness_async(self, corner_name):
+        # Capturing takes a while, keep it off the GUI thread
+        def run():
+            try:
+                self.measure_corner_sharpness(corner_name)
+            except Exception as e:
+                self.ac.microscope.log("Corner %s: sharpness failed: %s" %
+                                       (corner_name, e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def update_pconfig_focus_check(self, pconfig):
+        focus_check = pconfig.get("focus-check")
+        if focus_check is None:
+            return
+        reference = {}
+        for corner_name in self.corner_widgets.keys():
+            if corner_name in self.corner_sharpness:
+                reference[corner_name] = self.corner_sharpness[corner_name]
+        focus_check["reference"] = reference
+
+    def cache_save_sharpness(self, j):
+        j["sharpness"] = dict(self.corner_sharpness)
+
+    def cache_load_sharpness(self, j):
+        self.corner_sharpness = dict(j.get("sharpness", {}))
 
     def emit_go_corner(self, corner_name, done=None):
         self.go_corner.emit((corner_name, done))
@@ -794,7 +877,7 @@ class XYPlanner2PWidget(PlannerWidget):
                 def go_clicked():
                     pos = self.get_corner_move_pos(corner_name)
                     if pos is not None:
-                        self.ac.motion_thread.move_absolute(pos)
+                        self.ac.mainTab.motion_widget.moveto(pos)
 
                 self.corner_widgets[corner_name]["pb"].clicked.connect(
                     go_clicked)
@@ -816,6 +899,7 @@ class XYPlanner2PWidget(PlannerWidget):
             "x1": str(self.plan_x1_le.text()),
             "y1": str(self.plan_y1_le.text()),
         }
+        self.cache_save_sharpness(cachej["XY2P"])
 
     def _cache_load(self, cachej):
         j = cachej.get("XY2P", {})
@@ -823,6 +907,7 @@ class XYPlanner2PWidget(PlannerWidget):
         self.plan_y0_le.setText(j.get("y0", ""))
         self.plan_x1_le.setText(j.get("x1", ""))
         self.plan_y1_le.setText(j.get("y1", ""))
+        self.cache_load_sharpness(j)
 
     def _poll_misc(self):
         last_pos = self.ac.motion_thread.get_pos_cache()
@@ -866,6 +951,7 @@ class XYPlanner2PWidget(PlannerWidget):
         except Exception as e:
             self.log(f"Scan config aborted: {e}")
             return
+        self.update_pconfig_focus_check(pconfig)
 
         # Ignored app specific metadata
         pconfig["app"] = {
@@ -903,6 +989,7 @@ class XYPlanner2PWidget(PlannerWidget):
             self.ac.usc.motion.format_position("x", pos["x"]))
         self.plan_y0_le.setText(
             self.ac.usc.motion.format_position("y", pos["y"]))
+        self.measure_corner_sharpness_async("ll")
 
     def x_view(self):
         # XXX: maybe put better abstraction on this
@@ -923,8 +1010,9 @@ class XYPlanner2PWidget(PlannerWidget):
             self.ac.usc.motion.format_position("x", pos["x"]))
         self.plan_y1_le.setText(
             self.ac.usc.motion.format_position("y", pos["y"]))
+        self.measure_corner_sharpness_async("ur")
 
-    def corner_clicked(self, corner_name):
+    def corner_clicked(self, corner_name, measure=True):
         pos_cur = self.ac.motion_thread.get_pos_cache()
         widgets = self.corner_widgets[corner_name]
 
@@ -932,6 +1020,8 @@ class XYPlanner2PWidget(PlannerWidget):
             self.ac.usc.motion.format_position("x", pos_cur["x"]))
         widgets["y_le"].setText(
             self.ac.usc.motion.format_position("y", pos_cur["y"]))
+        if measure:
+            self.measure_corner_sharpness_async(corner_name)
 
     def get_corner_widget_pos(self, corner_name):
         widgets = self.corner_widgets[corner_name]
@@ -996,7 +1086,7 @@ class XYPlanner3PWidget(PlannerWidget):
             def go_clicked():
                 pos = self.get_corner_move_pos(corner_name)
                 if pos is not None:
-                    self.ac.motion_thread.move_absolute(pos)
+                    self.ac.mainTab.motion_widget.moveto(pos)
 
             pb_go.clicked.connect(go_clicked)
 
@@ -1051,6 +1141,7 @@ class XYPlanner3PWidget(PlannerWidget):
                 "z_le": str(widgets["z_le"].text()),
             }
             j1[group] = j2
+        self.cache_save_sharpness(j1)
         cachej["XY3P"] = j1
 
     def _cache_load(self, cachej):
@@ -1068,6 +1159,7 @@ class XYPlanner3PWidget(PlannerWidget):
             widgets["x_le"].setText(j2.get("x_le", ""))
             widgets["y_le"].setText(j2.get("y_le", ""))
             widgets["z_le"].setText(j2.get("z_le", ""))
+        self.cache_load_sharpness(j1)
 
     def af_corners(self):
         return ("ul", "ll", "lr")
@@ -1118,7 +1210,13 @@ class XYPlanner3PWidget(PlannerWidget):
                                                objective=objective,
                                                corners=corner_json)
 
-        self.ac.mw.update_pconfig(pconfig)
+        try:
+            self.ac.mw.update_pconfig(pconfig)
+        # especially ValueError from bad GUI items
+        except Exception as e:
+            self.log(f"Scan config aborted: {e}")
+            return
+        self.update_pconfig_focus_check(pconfig)
 
         # Ignored app specific metadata
         pconfig["app"] = {
@@ -1146,7 +1244,7 @@ class XYPlanner3PWidget(PlannerWidget):
         y_view = 1.0 * x_view * im_h_pix / im_w_pix
         return x_view, y_view
 
-    def corner_clicked(self, corner_name):
+    def corner_clicked(self, corner_name, measure=True):
         pos_cur = self.ac.motion_thread.get_pos_cache()
         widgets = self.corner_widgets[corner_name]
 
@@ -1157,6 +1255,8 @@ class XYPlanner3PWidget(PlannerWidget):
         if "z" in pos_cur:
             widgets["z_le"].setText(
                 self.ac.usc.motion.format_position("z", pos_cur["z"]))
+        if measure:
+            self.measure_corner_sharpness_async(corner_name)
 
     def get_corner_widget_pos(self, corner_name):
         widgets = self.corner_widgets[corner_name]
@@ -1204,12 +1304,82 @@ Set output job name
 """
 
 
+# (pconfig mode, GUI label)
+FOCUS_EACH_MODES = (
+    ("off", "Off"),
+    ("sharpness", "Only when blurrier than corners"),
+    ("always", "Always (slow)"),
+)
+
+
 class ImagingOptionsWindow(QWidget):
     def __init__(self, itw, parent=None):
         super().__init__(parent=parent)
         self.itw = itw
         self.ac = self.itw.ac
         self.initUI()
+
+    def focus_each_mode(self):
+        if not self.ac.microscope.has_z():
+            return "off"
+        return FOCUS_EACH_MODES[self.focus_each_cb.currentIndex()][0]
+
+    def set_focus_each_mode(self, mode):
+        for i, (this_mode, _label) in enumerate(FOCUS_EACH_MODES):
+            if this_mode == mode:
+                self.focus_each_cb.setCurrentIndex(i)
+
+    def focus_ratios(self):
+        """
+        Returns (refocus_ratio, low_ratio) as fractions
+        """
+        ret = []
+        for name, le in (("Refocus below", self.refocus_ratio_le),
+                         ("Report low below", self.low_ratio_le)):
+            try:
+                ret.append(float(str(le.text()).strip().rstrip("%")) / 100)
+            except ValueError:
+                raise ValueError("Bad %s percentage %r" % (name, le.text()))
+        return tuple(ret)
+
+    def update_manual_focus_enabled(self):
+        enabled = self.ac.microscope.has_z() and bool(
+            str(self.retake_only_le.text()).strip())
+        self.manual_focus_cb.setEnabled(enabled)
+        if not enabled:
+            self.manual_focus_cb.setChecked(False)
+
+    def manual_focus_enabled(self):
+        return self.manual_focus_cb.isEnabled(
+        ) and self.manual_focus_cb.isChecked()
+
+    def retake_load_clicked(self):
+        """
+        Fill "Retake only" from a planner "only" file
+        Ex: low_sharpness.json / refocused.json written by a scan
+        """
+        fn, _filter = QFileDialog.getOpenFileName(
+            self, "Load retake list",
+            self.ac.usc.app("argus").scan_dir(), "JSON (*.json)")
+        if not fn:
+            return
+        try:
+            with open(fn) as f:
+                only = json.load(f).get("only")
+        except Exception as e:
+            self.ac.log(f"Retake list: failed to load {fn}: {e}")
+            return
+        # Empty would mean "everything", don't silently turn it into a full scan
+        if not only:
+            self.ac.log(f"Retake list: no images in {fn}, nothing to retake")
+            return
+        if not all(isinstance(tile, str) for tile in only):
+            self.ac.log(
+                f"Retake list: {fn} has ranges, only tile names are supported here"
+            )
+            return
+        self.retake_only_le.setText(", ".join(only))
+        self.ac.log(f"Retake list: loaded {len(only)} images from {fn}")
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -1242,13 +1412,26 @@ class ImagingOptionsWindow(QWidget):
             layout.addWidget(QLabel("Autofocus corners?"), row, 1)
             row += 1
 
-            self.autofocus_each_cb = QCheckBox()
-            self.autofocus_each_cb.setChecked(False)
-            self.autofocus_each_cb.setEnabled(self.ac.microscope.has_z())
-            self.autofocus_each_cb.stateChanged.connect(
+            layout.addWidget(QLabel("Focus each image"), row, 0)
+            self.focus_each_cb = QComboBox()
+            for _mode, label in FOCUS_EACH_MODES:
+                self.focus_each_cb.addItem(label)
+            self.focus_each_cb.setEnabled(self.ac.microscope.has_z())
+            self.focus_each_cb.currentIndexChanged.connect(
                 self.itw.update_imaging_config)
-            layout.addWidget(self.autofocus_each_cb, row, 0)
-            layout.addWidget(QLabel("Autofocus each image?"), row, 1)
+            layout.addWidget(self.focus_each_cb, row, 1)
+            row += 1
+
+            # Percent of the corner sharpness (measured when setting corners)
+            layout.addWidget(QLabel("Refocus below (% of corners)"), row, 0)
+            self.refocus_ratio_le = QLineEdit("70")
+            layout.addWidget(self.refocus_ratio_le, row, 1)
+            row += 1
+
+            layout.addWidget(QLabel("Report low below (% of corners)"), row,
+                             0)
+            self.low_ratio_le = QLineEdit("50")
+            layout.addWidget(self.low_ratio_le, row, 1)
             row += 1
 
             # Partial scan to retake bad tiles. Not cached on purpose:
@@ -1258,6 +1441,18 @@ class ImagingOptionsWindow(QWidget):
             self.retake_only_le.setPlaceholderText(
                 "all tiles (or e.g. c005_r003, c006_r003)")
             layout.addWidget(self.retake_only_le, row, 1)
+            self.retake_load_pb = QPushButton("Load...")
+            self.retake_load_pb.clicked.connect(self.retake_load_clicked)
+            layout.addWidget(self.retake_load_pb, row, 2)
+            row += 1
+
+            # Retake scans only. Not cached for the same reason as above
+            self.manual_focus_cb = QCheckBox()
+            self.manual_focus_cb.setEnabled(False)
+            self.retake_only_le.textChanged.connect(
+                self.update_manual_focus_enabled)
+            layout.addWidget(self.manual_focus_cb, row, 0)
+            layout.addWidget(QLabel("Manual focus each retake?"), row, 1)
             row += 1
 
             def process_gb():
@@ -1350,6 +1545,8 @@ class ImagingTaskWidget(AWidget):
         self._save_extension = None
         self.taking_snapshot = False
         self.planner_progress_cache = None
+        # Planner paused waiting for the user to focus a retake image
+        self.manual_focus_waiting = False
         self.snapshotDone.connect(self.snapshot_done)
         self.capture_mode = "composite"
 
@@ -1448,6 +1645,18 @@ class ImagingTaskWidget(AWidget):
             self.planner_progress_cache["eta_message"] = bench_str
             self.ac.log('%s' % (bench_str))
             self.progress_bar.setValue(state["images_captured"])
+        elif state["type"] == "manual_focus":
+            # Planner already paused itself. Let the user jog until Continue
+            self.manual_focus_waiting = True
+            self.ac.motion_thread.jog_enable(True)
+            # Allow extra snapshots (ex: at other focus) while waiting
+            if not self.taking_snapshot:
+                self.snapshot_pb.setEnabled(True)
+            self.go_pause_pb.setText("Continue (focused)")
+            self.ac.log(
+                "Manual focus: focus %s with jog / joystick, then press Continue"
+                % (state["tile"], ))
+            QApplication.alert(self.window())
         else:
             pass
 
@@ -1465,6 +1674,8 @@ class ImagingTaskWidget(AWidget):
         last_scan_config = self.current_planner_hconfig
         self.current_planner_hconfig = None
         self.planner_progress_cache = None
+        # Planner paused waiting for the user to focus a retake image
+        self.manual_focus_waiting = False
 
         # Restore defaults between each run
         # Ex: if HDR doesn't clean up simplifies things
@@ -1620,9 +1831,13 @@ class ImagingTaskWidget(AWidget):
                             block=True)
 
                         se.poll()
+                        planner_widget.measure_corner_sharpness(corner)
+
+                        se.poll()
                         done.clear()
                         planner_widget.emit_click_corner(corner_name=corner,
-                                                         done=done)
+                                                         done=done,
+                                                         measure=False)
                         done.wait()
 
                     se.poll()
@@ -1637,6 +1852,16 @@ class ImagingTaskWidget(AWidget):
         if self.ac.planner_thread:
             # Pause
             if self.ac.planner_thread.is_paused():
+                if self.manual_focus_waiting:
+                    # Don't let the scan capture while a snapshot is capturing
+                    if self.taking_snapshot:
+                        self.ac.log(
+                            "Manual focus: wait for snapshot to finish, then press Continue"
+                        )
+                        return
+                    self.manual_focus_waiting = False
+                    self.ac.motion_thread.jog_enable(False)
+                    self.snapshot_pb.setEnabled(False)
                 self.go_pause_pb.setText("Pause")
                 self.ac.planner_thread.unpause()
             else:
@@ -1655,18 +1880,42 @@ class ImagingTaskWidget(AWidget):
                 warning = f"\n\nWARNING: you have automatic exposure ({auto_exposure}) and/or color correction ({auto_color}) enabled. This will lead to an inconsistent capture"
                 mb_type = QMessageBox.warning
 
-            scan_settings = "Scan settings:"
-            scan_settings += "\nAutofocus corners: %s" % (autofocus, )
-            scan_settings += "\nAutofocus each image: %s" % (
-                self.iow.autofocus_each_cb.isChecked(), )
             try:
                 retake_only = self.retake_only()
             except ValueError as e:
                 self.ac.log(f"Scan aborted: {e}")
                 return
+
+            scan_settings = "Scan settings:"
+            scan_settings += "\nAutofocus corners: %s" % (autofocus, )
+            scan_settings += "\nFocus each image: %s" % (
+                self.iow.focus_each_cb.currentText(), )
+            if retake_only and self.iow.manual_focus_enabled():
+                scan_settings += "\nManual focus before each retake (replaces automatic focus each image)"
+            elif self.iow.focus_each_mode() == "sharpness":
+                try:
+                    refocus_ratio, low_ratio = self.iow.focus_ratios()
+                except ValueError as e:
+                    self.ac.log(f"Scan aborted: {e}")
+                    return
+                planner_widget = self.ac.mainTab.active_planner_widget()
+                corners = [
+                    "%s %0.1f" % (corner, planner_widget.corner_sharpness[corner])
+                    for corner in planner_widget.corner_widgets.keys()
+                    if corner in planner_widget.corner_sharpness
+                ]
+                scan_settings += "\n  Refocus below %0.0f%%, report below %0.0f%%" % (
+                    refocus_ratio * 100, low_ratio * 100)
+                scan_settings += "\n  Corner sharpness: %s" % (
+                    ", ".join(corners) if corners else
+                    "none (set corners again), first image used instead", )
             if retake_only:
                 scan_settings += "\nPARTIAL SCAN, retake only: %s" % (
                     ", ".join(retake_only), )
+                motion_widget = self.ac.mainTab.motion_widget
+                if motion_widget.moveto_feed_fraction() is not None:
+                    scan_settings += "\n  Moving to each image and back to start at %0.3g%% speed (MoveTo speed)" % (
+                        motion_widget.moveto_slider.get_jog_percentage(), )
             if self.ac.advancedTab.image_stacking_enabled():
                 pm_n = self.ac.advancedTab.image_stacking_pm_n()
                 scan_settings += "\nFocus stacking enabled (+/- %u images => %u per stack)" % (
@@ -1753,7 +2002,9 @@ class ImagingTaskWidget(AWidget):
         self.ac.task_thread.offload(offload)
 
     def snapshot_done(self):
-        self.snapshot_pb.setEnabled(True)
+        # Scans keep it disabled, except while waiting for manual focus
+        self.snapshot_pb.setEnabled(self.ac.planner_thread is None
+                                    or self.manual_focus_waiting)
         self.taking_snapshot = False
 
     def save_extension(self):
@@ -1787,12 +2038,27 @@ class ImagingTaskWidget(AWidget):
         imagerj["save_quality"] = self.ac.usc.imager.save_quality()
         # FIXME: move scan autofocus from Argus to planner
         # imagerj["autofocus"] = self.iow.autofocus_cb.isChecked()
-        if self.ac.microscope.has_z() and self.iow.autofocus_each_cb.isChecked(
-        ):
+        focus_each = self.iow.focus_each_mode()
+        if focus_each == "always":
             pconfig["points-autofocus"] = {}
+        elif focus_each == "sharpness":
+            refocus_ratio, low_ratio = self.iow.focus_ratios()
+            # Corner reference sharpness is filled in by the planner widget
+            # Keep advanced keys (ex: offset_radius) from microscope "planner"
+            focus_check = dict(pconfig.get("focus-check", {}))
+            focus_check["refocus_ratio"] = refocus_ratio
+            focus_check["low_ratio"] = low_ratio
+            pconfig["focus-check"] = focus_check
         retake_only = self.retake_only()
         if retake_only:
             pconfig["only"] = retake_only
+            # Same speed as the MoveTo buttons
+            feed_fraction = self.ac.mainTab.motion_widget.moveto_feed_fraction(
+            )
+            if feed_fraction is not None:
+                pconfig["retake_feed_fraction"] = feed_fraction
+            if self.iow.manual_focus_enabled():
+                pconfig["manual-focus"] = {}
 
     def retake_only(self):
         """
@@ -1830,7 +2096,9 @@ class ImagingTaskWidget(AWidget):
             # However its useful for debug dumps
             "cloudstitch": self.iow.cloudstitch_cb.isChecked(),
             "autofocus": self.iow.autofocus_cb.isChecked(),
-            "autofocus_each": self.iow.autofocus_each_cb.isChecked(),
+            "focus_each": self.iow.focus_each_mode(),
+            "refocus_ratio": str(self.iow.refocus_ratio_le.text()),
+            "low_ratio": str(self.iow.low_ratio_le.text()),
             "add_scalebar": self.iow.add_scalebar_cb.isChecked(),
             "keep_intermediate": self.iow.keep_intermediate_cb.isChecked(),
             "html": self.iow.html_cb.isChecked(),
@@ -1845,8 +2113,9 @@ class ImagingTaskWidget(AWidget):
         self.iow.stitch_gb.setChecked(j.get("stitch", True))
         self.iow.autofocus_cb.setChecked(
             j.get("autofocus", self.ac.microscope.has_z()))
-        self.iow.autofocus_each_cb.setChecked(
-            j.get("autofocus_each", False) and self.ac.microscope.has_z())
+        self.iow.set_focus_each_mode(j.get("focus_each", "off"))
+        self.iow.refocus_ratio_le.setText(j.get("refocus_ratio", "70"))
+        self.iow.low_ratio_le.setText(j.get("low_ratio", "50"))
         self.iow.add_scalebar_cb.setChecked(j.get("add_scalebar", False))
         self.iow.keep_intermediate_cb.setChecked(
             j.get("keep_intermediate", True))
@@ -1859,7 +2128,7 @@ class ImagingTaskWidget(AWidget):
             "stitch": self.iow.stitch_gb.isChecked(),
             "add_scalebar": self.iow.add_scalebar_cb.isChecked(),
             "autofocus": self.iow.autofocus_cb.isChecked(),
-            "autofocus_each": self.iow.autofocus_each_cb.isChecked(),
+            "focus_each": self.iow.focus_each_mode(),
         }
 
 

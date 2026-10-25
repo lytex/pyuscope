@@ -1572,7 +1572,16 @@ class GrblHal(MotionHAL):
 
     def _move_absolute(self, pos, tries=3):
         # print("grbl mv_abs", pos)
-        self.grbl.move_absolute(self._move_absolute_adjust_wcs(pos), f=1000)
+        f = 1000
+        if self.move_feed_fraction < 1.0:
+            # 1000 may already be above the machine max rate, which then caps
+            # the move. Scale what the slowest moving axis can actually do
+            max_velocities = self._get_max_velocities()
+            base = min([f] + [
+                max_velocities[axis] for axis in pos if axis in max_velocities
+            ])
+            f = max(1, int(base * self.move_feed_fraction))
+        self.grbl.move_absolute(self._move_absolute_adjust_wcs(pos), f=f)
 
     def _move_relative(self, pos):
         # print("grbl mv_rel", pos)

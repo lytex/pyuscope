@@ -1046,7 +1046,7 @@ class StitchingTab(ArgusTab):
 
         # Offload uploads etc to thread since they might take a while
         cs_info = None
-        if ippj["cloud_stitch"]:
+        if ippj.get("cloud_stitch"):
             cs_info = self.get_cs_info()
             if not cs_info.is_plausible():
                 self.log(

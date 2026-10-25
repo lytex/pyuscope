@@ -134,8 +134,17 @@ def get_planner(microscope,
         pipeline_names.append("points-xy2p")
     if "points-xy3p" in pconfig:
         pipeline_names.append("points-xy3p")
-    if "points-autofocus" in pconfig:
+    # Manual focus replaces automatic per image focus
+    # (focus-check would otherwise override the user right after capture)
+    manual_focus = "manual-focus" in pconfig
+    focus_check = "focus-check" in pconfig and not manual_focus
+    if "points-autofocus" in pconfig and not manual_focus:
         pipeline_names.append("points-autofocus")
+    if manual_focus:
+        pipeline_names.append("manual-focus")
+    # Stack slices are blurry by design => check a probe frame before stacking
+    if focus_check and "points-stacker" in pconfig:
+        pipeline_names.append("focus-check")
     if "points-stacker" in pconfig:
         pipeline_names.append("points-stacker")
     # FIXME: needs review / testing
@@ -147,6 +156,9 @@ def get_planner(microscope,
     if not imager.remote():
         pipeline_names.append("kinematics")
     pipeline_names.append("image-capture")
+    # Check the scan image itself before it gets saved
+    if focus_check and "points-stacker" not in pconfig:
+        pipeline_names.append("focus-check")
     if not imager.remote():
         pipeline_names.append("image-save")
     # pipeline_names.append("scraper")

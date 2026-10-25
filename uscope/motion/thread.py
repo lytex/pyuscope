@@ -34,7 +34,10 @@ class MotionThreadMotion(MotionHAL):
         self.mt.home(block=True)
 
     def _move_absolute(self, pos):
-        self.mt.move_absolute(pos, block=True)
+        feed_fraction = None
+        if self.move_feed_fraction < 1.0:
+            feed_fraction = self.move_feed_fraction
+        self.mt.move_absolute(pos, block=True, feed_fraction=feed_fraction)
 
     def _move_relative(self, pos):
         self.mt.move_relative(pos, block=True)
@@ -291,9 +294,18 @@ class MotionThreadBase(CommandThreadBase):
     def backlash_enable(self, block=False):
         self.command("backlash_enable", block=block)
 
-    def move_absolute(self, pos, block=False, callback=None, done=None):
+    def move_absolute(self,
+                      pos,
+                      block=False,
+                      callback=None,
+                      done=None,
+                      feed_fraction=None):
+        """
+        feed_fraction: move slower than normal (0 to 1.0), None for normal
+        """
         self.command("move_absolute",
                      pos,
+                     feed_fraction,
                      block=block,
                      callback=callback,
                      done=done)
@@ -414,9 +426,12 @@ class MotionThreadBase(CommandThreadBase):
                 def default(*args):
                     raise Exception("Bad command %s" % (command, ))
 
-                def move_absolute(pos):
+                def move_absolute(pos, feed_fraction=None):
+                    options = {}
+                    if feed_fraction is not None:
+                        options["feed_fraction"] = feed_fraction
                     try:
-                        self.motion.move_absolute(pos)
+                        self.motion.move_absolute(pos, options=options)
                     except AxisExceeded as e:
                         self.log(str(e))
                     return self.motion.pos()

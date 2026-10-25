@@ -1,6 +1,7 @@
 import math
 import re
 from collections import OrderedDict
+import json
 import os
 import time
 from uscope.planner.plugin import PlannerPlugin, register_plugin
@@ -9,7 +10,7 @@ from uscope.imager.imager_util import get_scaled
 from uscope.motion.hal import pos_str
 from uscope.kinematics import Kinematics
 from numpy import polyfit
-from uscope.imager.autofocus import choose_best_image, Autofocus
+from uscope.imager.autofocus import choose_best_image, image_sharpness, Autofocus
 from enum import Enum
 
 
@@ -248,6 +249,17 @@ def gen_selected_pos_ll_ul(self):
             yield x
 
 
+def xy_move_options(self):
+    """
+    Options for moves to each XY position and the return at scan end
+    Retake scans can travel slower (Argus "MoveTo speed" slider)
+    """
+    feed_fraction = self.pc.retake_feed_fraction()
+    if self.pc.only() is None or feed_fraction is None:
+        return {}
+    return {"feed_fraction": feed_fraction}
+
+
 def log_scan_xy_begin(self):
     # A true useful metric of efficieny loss is how many extra pictures we had to take
     # Maybe overhead is a better way of reporting it
@@ -354,6 +366,9 @@ def log_scan_xy_begin(self):
     if self.pc.only() is not None:
         self.log('    Partial scan: only %u / %u tiles' %
                  (self.points_expected(), self.rows * self.cols))
+        if self.pc.retake_feed_fraction() is not None:
+            self.log('    Moving to each tile and back at %0.3g%% speed' %
+                     (self.pc.retake_feed_fraction() * 100, ))
     self.log('    step: %0.3f x, %0.3f y' % (self.x.step(), self.y.step()))
 
 
@@ -523,7 +538,7 @@ class PointGenerator2P(PlannerPlugin):
                 (self.itered_xy_points, self.images_expected(), ul_col, ul_row,
                  self.microscope.usc.motion.format_positions(pos)))
 
-            self.motion.move_absolute(pos)
+            self.motion.move_absolute(pos, options=xy_move_options(self))
 
             modifiers = {
                 "filename_part": self.filename_part(ul_col, ul_row),
@@ -540,7 +555,7 @@ class PointGenerator2P(PlannerPlugin):
         pos = self.calc_pos(0, 0)
         self.log(f"XY2P: returning XY at scan end: %s" %
                  self.microscope.usc.motion.format_positions(pos))
-        self.motion.move_absolute(pos)
+        self.motion.move_absolute(pos, options=xy_move_options(self))
 
     def log_scan_end(self):
         self.log('XY2P: generated points: %u / %u' %
@@ -669,6 +684,9 @@ class PointGenerator3P(PlannerPlugin):
         self.setup_axes()
         self.calc_per_rc()
         self.itered_xy_points = 0
+        # Optional fn(ul_col, ul_row) => z offset added on top of the corner plane
+        # Set by focus-check to carry refocus corrections to nearby tiles
+        self.z_offset_fn = None
         assert self.pc.motion_origin() == "ll"
         self.xy_pattern = self.pc.xy_pattern()
 
@@ -873,7 +891,7 @@ class PointGenerator3P(PlannerPlugin):
             # ideally we'd also aggregate the XY and first Z movements together
             if self.planner.stacking():
                 del pos["z"]
-        self.motion.move_absolute(pos)
+        self.motion.move_absolute(pos, options=xy_move_options(self))
 
     def iterate(self, state):
         for (pos, _ll, (ul_col, ul_row)) in gen_selected_pos_ll_ul(self):
@@ -881,6 +899,8 @@ class PointGenerator3P(PlannerPlugin):
             self.itered_xy_points += 1
             if "z" in pos and not self.tracking_z:
                 del pos["z"]
+            if "z" in pos and self.z_offset_fn:
+                pos["z"] += self.z_offset_fn(ul_col, ul_row)
             self.log(
                 "XY3P: %u / %u @ c=%u, r=%u, %s" %
                 (self.itered_xy_points, self.images_expected(), ul_col, ul_row,
@@ -903,7 +923,7 @@ class PointGenerator3P(PlannerPlugin):
             del pos["z"]
         self.log("XY3P: returning XYZ at scan end to %s" %
                  (self.microscope.usc.motion.format_positions(pos)))
-        self.motion.move_absolute(pos)
+        self.motion.move_absolute(pos, options=xy_move_options(self))
 
     def log_scan_begin(self):
         self.log("XY3P")
@@ -983,6 +1003,338 @@ class PlannerAutofocus(PlannerPlugin):
         meta["points-autofocus"] = {
             "mode": self.mode,
             "focused": self.focused,
+        }
+
+
+"""
+Partial (retake) scans only: wait for the user to focus each image by hand
+Pauses the planner at every XY position, Argus enables jogging until Continue
+"""
+
+
+class PlannerManualFocus(PlannerPlugin):
+    def __init__(self, planner):
+        super().__init__(planner=planner)
+        if self.pc.only() is None:
+            raise ValueError("Manual focus is only supported on retake scans")
+        self.focused = 0
+        self.zs = OrderedDict()
+
+    def log_scan_begin(self):
+        self.log("Manual focus before each image")
+
+    def iterate(self, state):
+        if self.dry:
+            yield None
+            return
+        tile = "c%03u_r%03u" % (state["col"], state["row"])
+        self.focused += 1
+        self.log("Manual focus: %s (%u / %u), focus then press Continue" %
+                 (tile, self.focused,
+                  self.planner.pipeline_xy().points_expected()))
+        self.planner.pause()
+        self.planner.emit_progress({
+            "type": "manual_focus",
+            "tile": tile,
+        })
+        # Like wait_unpaused() but also honor Stop while waiting
+        while self.planner.is_paused():
+            self.planner.se.poll()
+            self.planner.check_running()
+            time.sleep(0.1)
+        z = self.motion.pos()["z"]
+        self.zs[tile] = z
+        # Stacker centers on z_center
+        self.planner.z_center = z
+        self.log("Manual focus: %s z=%0.6f" % (tile, z))
+        yield None
+
+    def gen_meta(self, meta):
+        meta["manual-focus"] = {
+            "z": self.zs,
+        }
+
+
+"""
+Refocus only when an image is noticeably blurrier than the scan corners
+Reference sharpness is measured by Argus when each corner is set and
+interpolated across the grid
+
+Without stacking: placed after image-capture and checks the scan image itself,
+refocusing and recapturing if needed
+With stacking: placed before the stacker and checks a probe frame at the
+stack center, since individual stack slices are expected to be blurry
+
+At scan end writes, in the planner "only" format for a partial rescan:
+-low_sharpness.json: images still below low_ratio after any refocus
+-refocused.json: images that needed a refocus
+"""
+
+
+class PlannerFocusCheck(PlannerPlugin):
+    def __init__(self, planner):
+        super().__init__(planner=planner)
+        config = self.pc.j["focus-check"]
+        # {"ll": 123.4, "ul": ..., "lr": ...} or {"ll": ..., "ur": ...}
+        self.reference = dict(config.get("reference", {}))
+        # Refocus when sharpness < refocus_ratio * reference
+        self.refocus_ratio = float(config.get("refocus_ratio", 0.7))
+        # Report when final sharpness < low_ratio * reference
+        self.low_ratio = float(config.get("low_ratio", 0.5))
+        # "coarse" (coarse + fine) or "fine" search when refocusing
+        self.mode = config.get("mode", "coarse")
+        assert self.mode in ("coarse", "fine"), self.mode
+        self.probe = "points-stacker" in self.pc.j
+        # Local Z correction on top of the 3 corner plane (XY3P w/ Z only)
+        # Each accepted refocus leaves a residual vs the plane at its tile,
+        # subsequent tiles get a weighted blend of residuals within radius
+        self.offset_radius = float(config.get("offset_radius", 2.5))
+        self.offset_radius_full = float(config.get("offset_radius_full", 1.5))
+        # mm, default: coarse autofocus search range
+        self.max_offset = config.get("max_offset")
+        # (col, row) => residual
+        self.residuals = OrderedDict()
+        self.applied_offsets = {}
+        self.xy3p = None
+        self.tiles = OrderedDict()
+        self.refocused = []
+        self.low = []
+
+    def scan_begin(self, state):
+        self.objective_config = planner_objective_config(self)
+        self.af = planner_autofocus(self)
+        self.get_mode = self.pc.j["imager"].get("get_mode", "processed")
+        xy = self.planner.pipeline.get(
+            "points-xy3p") or self.planner.pipeline.get("points-xy2p")
+        self.cols = xy.cols
+        self.rows = xy.rows
+        # XY2P doesn't move z: the refocused z simply carries forward
+        xy3p = self.planner.pipeline.get("points-xy3p")
+        if xy3p and xy3p.tracking_z:
+            self.xy3p = xy3p
+            if self.max_offset is None:
+                self.max_offset = self.af.coarse_range(self.objective_config)
+            self.max_offset = float(self.max_offset)
+            xy3p.z_offset_fn = self.z_offset_at
+
+    def log_scan_begin(self):
+        self.log("Focus check: refocus below %0.0f%%, report below %0.0f%%" %
+                 (self.refocus_ratio * 100, self.low_ratio * 100))
+        if self.reference:
+            for corner, sharpness in self.reference.items():
+                self.log("  %s reference sharpness: %0.1f" %
+                         (corner, sharpness))
+        else:
+            self.log("  No corner sharpness, using first image as reference")
+
+    def corner_ul_cr(self, corner):
+        # Corner tile in (ul_col, ul_row), assuming ll motion origin
+        return {
+            "ll": (0, self.rows - 1),
+            "ul": (0, 0),
+            "lr": (self.cols - 1, self.rows - 1),
+            "ur": (self.cols - 1, 0),
+        }[corner]
+
+    def reference_at(self, col, row):
+        """
+        Inverse distance weighted corner sharpness at a tile
+        """
+        num = 0.0
+        den = 0.0
+        for corner, sharpness in self.reference.items():
+            ccol, crow = self.corner_ul_cr(corner)
+            dx = (col - ccol) / max(1, self.cols - 1)
+            dy = (row - crow) / max(1, self.rows - 1)
+            d2 = dx * dx + dy * dy
+            if d2 == 0:
+                return sharpness
+            num += sharpness / d2
+            den += 1 / d2
+        return num / den
+
+    def plane_z(self, col, row):
+        # calc_pos() is in lower left coordinates, tiles are upper left
+        return self.xy3p.calc_pos(col, self.rows - 1 - row)["z"]
+
+    def z_offset_at(self, col, row):
+        """
+        Weighted average of residuals within offset_radius (nearer = more weight)
+        Applied in full up to offset_radius_full from the nearest residual
+        (immediate neighbors incl. diagonals), fading to 0 at offset_radius
+        """
+        num = 0.0
+        den = 0.0
+        d_min = None
+        n = 0
+        for (rcol, rrow), residual in self.residuals.items():
+            d = ((col - rcol)**2 + (row - rrow)**2)**0.5
+            if d >= self.offset_radius:
+                continue
+            w = 1.0 / max(d, 1.0)
+            num += w * residual
+            den += w
+            n += 1
+            d_min = d if d_min is None else min(d_min, d)
+        if not n:
+            offset = 0.0
+        else:
+            fade = (self.offset_radius - d_min) / max(
+                1e-9, self.offset_radius - self.offset_radius_full)
+            offset = min(1.0, fade) * num / den
+        offset = max(-self.max_offset, min(self.max_offset, offset))
+        self.applied_offsets["c%03u_r%03u" % (col, row)] = offset
+        if offset:
+            self.log("focus check: c%03u_r%03u z offset %+0.6f from %u refocus" %
+                     (col, row, offset, n))
+        return offset
+
+    def record_residual(self, col, row, tile, z, improved, low):
+        if not self.xy3p:
+            return
+        reason = None
+        if not improved:
+            reason = "refocus didn't improve sharpness"
+        elif low:
+            reason = "still below report threshold"
+        elif self.af.at_edge:
+            reason = "best focus at edge of search range"
+        if reason:
+            self.log("focus check: %s z not used for nearby tiles (%s)" %
+                     (tile, reason))
+            return None
+        residual = z - self.plane_z(col, row)
+        self.residuals[(col, row)] = residual
+        self.log("focus check: %s residual %+0.6f vs corner plane" %
+                 (tile, residual))
+        return residual
+
+    def wait_imaging(self):
+        kinematics = self.planner.pipeline.get("kinematics")
+        if kinematics:
+            kinematics.kinematics.wait_imaging_ok()
+
+    def capture(self):
+        self.wait_imaging()
+        return self.imager.get_by_mode(mode=self.get_mode)
+
+    def refocus(self):
+        start_pos = None
+        if self.probe and self.planner.z_center is not None:
+            start_pos = self.planner.z_center
+        if self.mode == "coarse":
+            z = self.af.coarse(self.objective_config, start_pos=start_pos)
+        else:
+            z = self.af.fine(self.objective_config, start_pos=start_pos)
+        self.planner.z_center = z
+        return z
+
+    def check(self, state, capim):
+        """
+        Returns the captured image to keep (possibly a refocused recapture)
+        """
+        col, row = state["col"], state["row"]
+        tile = "c%03u_r%03u" % (col, row)
+        sharpness = image_sharpness(capim.image)
+        if not self.reference:
+            # Nothing to compare against: focus this one and use it
+            self.log("focus check: %s no reference, refocusing" % tile)
+            self.refocus()
+            capim = self.capture()
+            sharpness = image_sharpness(capim.image)
+            self.reference = {"ul": sharpness}
+            # A single reference makes it constant across the grid
+        reference = self.reference_at(col, row)
+        ratio = sharpness / reference if reference else 1.0
+        tilej = {
+            "reference": reference,
+            "sharpness": sharpness,
+            "refocused": False,
+        }
+        self.log("focus check: %s sharpness %0.1f vs %0.1f (%0.0f%%)" %
+                 (tile, sharpness, reference, ratio * 100))
+        if ratio < self.refocus_ratio:
+            self.log("focus check: %s below %0.0f%%, refocusing" %
+                     (tile, self.refocus_ratio * 100))
+            z = self.refocus()
+            capim2 = self.capture()
+            sharpness2 = image_sharpness(capim2.image)
+            self.log("focus check: %s refocused z=%0.6f, sharpness %0.1f" %
+                     (tile, z, sharpness2))
+            tilej["refocused"] = True
+            tilej["sharpness_before"] = sharpness
+            self.refocused.append(tile)
+            improved = sharpness2 > sharpness
+            # Blank / featureless areas can make autofocus worse
+            if sharpness2 >= sharpness:
+                capim = capim2
+                sharpness = sharpness2
+            else:
+                self.log("focus check: %s keeping original, it was sharper" %
+                         (tile, ))
+            tilej["sharpness"] = sharpness
+            ratio = sharpness / reference if reference else 1.0
+            tilej["residual"] = self.record_residual(
+                col, row, tile, z, improved, ratio < self.low_ratio)
+        if ratio < self.low_ratio:
+            self.log("focus check: WARNING %s still low (%0.0f%%)" %
+                     (tile, ratio * 100))
+            self.low.append(tile)
+        if tile in self.applied_offsets:
+            tilej["z_offset"] = self.applied_offsets[tile]
+        self.tiles[tile] = tilej
+        return capim
+
+    def iterate(self, state):
+        if self.dry:
+            yield None
+            return
+        # Probe: before stacking, check a dedicated frame at the stack center
+        if self.probe:
+            if self.planner.z_center is not None:
+                self.motion.move_absolute({"z": self.planner.z_center})
+            self.check(state, self.capture())
+            yield None
+            return
+        # Otherwise check the scan image itself, once per XY position
+        capim = state.get("captured_image")
+        if capim is None or state.get("hdri", 0) or state.get(
+                "image_stabilization_i", 0):
+            yield None
+            return
+        capim = self.check(state, capim)
+        yield {}, {
+            "captured_image": capim,
+            "image": capim.image,
+        }
+
+    def scan_end(self, state):
+        if self.dry:
+            return
+        for fn, tiles in (("low_sharpness.json", self.low),
+                          ("refocused.json", self.refocused)):
+            with open(os.path.join(self.planner.out_dir, fn), "w") as f:
+                json.dump({"only": tiles}, f, indent=4)
+        self.log("Focus check: refocused %u / %u images" %
+                 (len(self.refocused), len(self.tiles)))
+        self.log("Focus check: %u images below %0.0f%%" %
+                 (len(self.low), self.low_ratio * 100))
+        if self.low:
+            self.log("  " + ", ".join(self.low))
+        self.log("  Retake lists: low_sharpness.json, refocused.json")
+
+    def gen_meta(self, meta):
+        meta["focus-check"] = {
+            "reference": self.reference,
+            "refocus_ratio": self.refocus_ratio,
+            "low_ratio": self.low_ratio,
+            "mode": self.mode,
+            "offset_radius": self.offset_radius,
+            "offset_radius_full": self.offset_radius_full,
+            "max_offset": self.max_offset,
+            "tiles": self.tiles,
+            "refocused": self.refocused,
+            "low": self.low,
         }
 
 
@@ -1454,6 +1806,8 @@ def register_plugins():
     register_plugin("points-xy2p", PointGenerator2P)
     register_plugin("points-xy3p", PointGenerator3P)
     register_plugin("points-autofocus", PlannerAutofocus)
+    register_plugin("focus-check", PlannerFocusCheck)
+    register_plugin("manual-focus", PlannerManualFocus)
     register_plugin("points-stacker", PlannerStacker)
     register_plugin("stacker-drift", StackerDrift)
     register_plugin("hdr", PlannerHDR)

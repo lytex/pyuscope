@@ -1140,6 +1140,13 @@ class PC:
     def exclude(self):
         return self.j.get('exclude', [])
 
+    def retake_feed_fraction(self):
+        """
+        Retake scans: fraction of normal speed for moves to each image
+        None for normal speed
+        """
+        return self.j.get("retake_feed_fraction")
+
     def only(self):
         """
         Partial scan: list of tiles to (re)capture, None for all

@@ -382,6 +382,11 @@ class Planner:
     def images_captured(self):
         return self.pipeline["scraper"].images_captured
 
+    def pipeline_xy(self):
+        """XY point generator plugin"""
+        return self.pipeline.get("points-xy3p") or self.pipeline.get(
+            "points-xy2p")
+
     def stacking(self):
         """Return true if focus stacking enabled"""
         return "points-stacker" in self.pipeline

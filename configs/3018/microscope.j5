@@ -15,15 +15,32 @@
         "source": "gst-v4l2src",
         // Camera only outputs MJPEG
         "source_mjpeg": true,
+        // v4l2-ctl --list-devices   
         "source_properties": {
-            "device": "/dev/video0",
+            "device": "/dev/v4l/by-id/usb-Linux_Foundation_Webcam_gadget-video-index0",
         },
         "width": 3840,
         "height": 2160,
-        "um_per_pixel_raw_1x": 0.064,
+        // 20x
+        // "um_per_pixel_raw_1x": 1.282,
+        // 60x
+        "um_per_pixel_raw_1x": 0.4273,
+    },
+    "kinematics": {
+        // Seconds to wait after each autofocus Z move before grabbing a frame.
+        // Default 0.1 is too short for a buffered USB MJPEG camera: stale
+        // frames make autofocus always pick the first (highest) position.
+        "tsettle_autofocus": 1.0,
+    },
+    "planner": {
+        // Fraction of each image overlapping adjacent images (default 0.3)
+        "overlap": 0.3,
     },
     "optics": {
-        "um_per_pixel_raw_1x": 0.064,
+        // 20x
+        // "um_per_pixel_raw_1x": 1.282,
+        // 60x
+        "um_per_pixel_raw_1x": 0.4273,
     },
     "systems": [
         {

@@ -628,6 +628,9 @@ class MotionHAL:
         self.modifiers = None
         self.options = None
         self.jog_estimated_end = None
+        # Fraction of normal speed for the move in progress (1.0 = normal)
+        # Set per move through move_absolute(options={"feed_fraction": ...})
+        self.move_feed_fraction = 1.0
 
         # Cache some computed values
         self._hal_max_velocities = None
@@ -1096,6 +1099,11 @@ class MotionHAL:
     def _move_absolute_wrap(self, pos, options={}):
         '''Absolute move to positions specified by pos dict'''
         pos = dict(pos)
+        # Nested moves made by modifiers (ex: backlash) inherit the outer speed
+        prev_feed_fraction = self.move_feed_fraction
+        self.move_feed_fraction = float(
+            options.get("feed_fraction", prev_feed_fraction))
+        assert 0 < self.move_feed_fraction <= 1.0, self.move_feed_fraction
         try:
             for modifier in self.iter_active_modifiers():
                 modifier.move_absolute_pre(pos, options=options)
@@ -1104,6 +1112,7 @@ class MotionHAL:
                 modifier.move_absolute_post(True, options=options)
             self.mv_lastt = time.time()
         finally:
+            self.move_feed_fraction = prev_feed_fraction
             self.cur_pos_cache_invalidate()
 
     def _move_absolute(self, pos):
